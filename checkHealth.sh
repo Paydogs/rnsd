@@ -24,6 +24,7 @@ NOTIFIER_STATE_DIR="${NOTIFIER_STATE_DIR:-/var/lib/analog-notifier}"
 NOTIFIER_CONF="${NOTIFIER_CONF_DIR}/notifier.conf"
 
 FAILS=0; WARNS=0
+NODE_HASH=""; NOTIFIER_REG=""
 pass() { printf '  \033[1;32mPASS\033[0m  %s\n' "$*"; }
 warn() { printf '  \033[1;33mWARN\033[0m  %s\n' "$*"; WARNS=$((WARNS + 1)); }
 fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAILS=$((FAILS + 1)); }
@@ -90,12 +91,31 @@ else
 fi
 if command -v rnstatus >/dev/null 2>&1 && svc_active rnsd; then
     out="$(timeout 20 su -s /bin/sh "${RNS_USER}" -c "rnstatus --config '${RNS_CONFIG_DIR}'" 2>&1)" || true
-    ifaces="$(printf '%s\n' "${out}" | grep -c 'Interface\[')"
-    up="$(printf '%s\n' "${out}" | grep -c 'Status *: Up')"
-    if [ "${ifaces}" -gt 0 ]; then
-        if [ "${up}" -gt 0 ]; then pass "rnstatus: ${up}/${ifaces} interfaces Up"
-        else fail "rnstatus: ${ifaces} interfaces, none Up"; fi
-        printf '%s\n' "${out}" | grep -B1 'Status *: Down' | grep 'Interface\[' | sed 's/^/          down: /'
+    # One line per interface, whatever is in the config: rnstatus prints the
+    # interface name on its own line (" <Type>[<name>]", one leading space), then indented
+    # "Status : Up|Down" and optional "Peers/Clients/Rate/Traffic" lines.
+    table="$(printf '%s\n' "${out}" | awk '
+        /^ ?[^ ].*\[.*\]$/ { if (name != "") emit(); name = $0; sub(/^ /, "", name); status = "?"; extra = ""; next }
+        name != "" && /^ +Status +:/  { sub(/^ +Status +: */, ""); status = $0; next }
+        name != "" && /^ +(Peers|Clients) +:/ { sub(/^ +/, ""); sub(/ +: */, ": "); extra = extra (extra == "" ? "" : ", ") $0; next }
+        name != "" && /^ +Rate +:/    { sub(/^ +Rate +: */, ""); extra = extra (extra == "" ? "" : ", ") "rate " $0; next }
+        function emit() { printf "%s\t%s\t%s\n", status, name, extra }
+        END { if (name != "") emit() }
+    ')"
+    total="$(printf '%s\n' "${table}" | grep -c .)"
+    up="$(printf '%s\n' "${table}" | grep -c '^Up')"
+    if [ "${total}" -gt 0 ]; then
+        if [ "${up}" -eq "${total}" ]; then pass "rnstatus: all ${total} interfaces Up"
+        elif [ "${up}" -gt 0 ]; then warn "rnstatus: ${up}/${total} interfaces Up"
+        else fail "rnstatus: ${total} interfaces, none Up"; fi
+        printf '%s\n' "${table}" | while IFS="$(printf '\t')" read -r st nm ex; do
+            case "${st}" in
+                Up*)   mark="\033[1;32m up \033[0m" ;;
+                Down*) mark="\033[1;31mdown\033[0m" ;;
+                *)     mark="\033[1;33m ?  \033[0m" ;;
+            esac
+            printf "          [${mark}] %s%s\n" "${nm}" "${ex:+  (${ex})}"
+        done
     else
         fail "rnstatus could not talk to rnsd: $(printf '%s' "${out}" | tail -1)"
     fi
@@ -114,6 +134,7 @@ if command -v lxmd >/dev/null 2>&1 && svc_active lxmd; then
     out="$(timeout 30 su -s /bin/sh "${RNS_USER}" -c "lxmd --status --config '${LXMD_CONFIG_DIR}' --rnsconfig '${RNS_CONFIG_DIR}'" 2>&1)" || true
     if printf '%s' "${out}" | grep -q 'Propagation Node running'; then
         pass "$(printf '%s\n' "${out}" | grep 'Propagation Node running' | sed 's/^LXMF //')"
+        NODE_HASH="$(printf '%s\n' "${out}" | sed -n 's/.*Propagation Node running on <\([0-9a-f]*\)>.*/\1/p')"
         printf '%s\n' "${out}" | grep -E 'Messagestore contains|Peers   :|available' | sed 's/^ */          /'
         avail="$(printf '%s\n' "${out}" | awk '/available/ { print $1 }')"
         [ -n "${avail}" ] && [ "${avail}" -eq 0 ] && warn "lxmd has 0 available peers (fresh node, or all peers unreachable)"
@@ -131,6 +152,56 @@ fi
 
 # =============================================================================
 section "analog-notifier"
+if [ -z "${NODE_HASH}" ] && [ -f "${LXMD_CONFIG_DIR}/identity" ]; then
+    NODE_HASH="$(su -s /bin/sh "${RNS_USER}" -c "python3 -c \"
+import RNS
+i = RNS.Identity.from_file('${LXMD_CONFIG_DIR}/identity')
+print(RNS.Destination.hash(i, 'lxmf', 'propagation').hex())\"" 2>/dev/null)"
+fi
+if [ -n "${NODE_HASH}" ]; then
+    pass "propagation node identifier (select this node in the Analog app): ${NODE_HASH}"
+else
+    warn "propagation node identifier unknown (lxmd --status failed and no identity file yet)"
+fi
+if [ -f "${NOTIFIER_STATE_DIR}/identity" ]; then
+    idout="$(su -s /bin/sh "${NOTIFIER_USER}" -c "python3 '${NOTIFIER_INSTALL_DIR}/analog_notifier.py' --config '${NOTIFIER_CONF}' --identity" 2>&1)"
+    reg="$(printf '%s\n' "${idout}" | sed -n 's/^registration destination : \([0-9a-f]*\).*/\1/p')"
+    if [ -n "${reg}" ]; then
+        NOTIFIER_REG="${reg}"
+        pass "notifier identity present; registration destination (analog.notifier.register): ${reg}"
+        perm="$(stat -c '%a %U' "${NOTIFIER_STATE_DIR}/identity" 2>/dev/null)"
+        [ "${perm}" = "600 ${NOTIFIER_USER}" ] || warn "identity file perms are '${perm}', expected '600 ${NOTIFIER_USER}'"
+    else
+        fail "notifier identity file exists but cannot be read: $(printf '%s' "${idout}" | tail -1)"
+    fi
+else
+    fail "notifier identity missing (${NOTIFIER_STATE_DIR}/identity) — run: install.sh --fix"
+fi
+# RPC key: rnsd and the notifier's RNS client config must carry the same rpc_key,
+# or link identification fails ("digest sent was rejected" → "unidentified").
+rk_rnsd="$(sed -n 's/^[[:space:]]*rpc_key[[:space:]]*=[[:space:]]*//p' "${RNS_CONFIG_DIR}/config" 2>/dev/null | head -1)"
+rk_noti="$(sed -n 's/^[[:space:]]*rpc_key[[:space:]]*=[[:space:]]*//p' "${NOTIFIER_STATE_DIR}/rns/config" 2>/dev/null | head -1)"
+if [ -z "${rk_rnsd}" ]; then fail "rnsd config has no rpc_key — identified requests will be refused as 'unidentified'; run: install.sh --fix"
+elif [ "${rk_rnsd}" != "${rk_noti}" ]; then fail "rpc_key differs between rnsd and the notifier's RNS config — run: install.sh --fix"
+else pass "rpc_key shared between rnsd and the notifier"; fi
+if [ "$INIT" = systemd ] && journalctl -u "${NOTIFIER_NAME}" -n 200 --no-pager -o cat 2>/dev/null | grep -q 'digest sent was rejected'; then
+    warn "recent 'digest sent was rejected' RPC errors in the notifier journal — if they persist after --fix + restart, the rpc_keys are out of sync"
+fi
+if [ -n "${NOTIFIER_REG}" ] && command -v rnpath >/dev/null 2>&1 && svc_active rnsd; then
+    if timeout 20 su -s /bin/sh "${RNS_USER}" -c "rnpath --config '${RNS_CONFIG_DIR}' -t" 2>/dev/null | grep -qi "${NOTIFIER_REG}"; then
+        pass "registration destination is announced (present in rnsd's path table)"
+    else
+        warn "registration destination not in rnsd's path table yet — the notifier announces every 5 min after start; check: journalctl -u ${NOTIFIER_NAME} -n 20"
+    fi
+fi
+node_conf="$(conf_get notifier propagation_node)"
+if [ -n "${node_conf}" ]; then
+    if [ -n "${NODE_HASH}" ] && [ "${node_conf}" != "${NODE_HASH}" ]; then
+        fail "notifier.conf propagation_node (${node_conf}) differs from the running lxmd node (${NODE_HASH}) — run: install.sh --fix"
+    else pass "notifier announces propagation node ${node_conf}"; fi
+else
+    warn "propagation_node not set in notifier.conf (apps cannot pair notifier and node) — run: install.sh --fix"
+fi
 svc_check "${NOTIFIER_NAME}"
 if ! id -u "${NOTIFIER_USER}" >/dev/null 2>&1; then
     fail "service user ${NOTIFIER_USER} does not exist"
@@ -207,6 +278,8 @@ fi
 
 # =============================================================================
 printf '\n'
+[ -n "${NODE_HASH}" ]    && printf 'Propagation node for the Analog app   : \033[1m%s\033[0m\n' "${NODE_HASH}"
+[ -n "${NOTIFIER_REG}" ] && printf 'Notifier registration destination     : \033[1m%s\033[0m  (analog.notifier.register)\n' "${NOTIFIER_REG}"
 if [ "${FAILS}" -eq 0 ] && [ "${WARNS}" -eq 0 ]; then printf '\033[1;32mAll checks passed.\033[0m\n'
 elif [ "${FAILS}" -eq 0 ]; then printf '\033[1;33m%s warning(s), no failures.\033[0m\n' "${WARNS}"
 else printf '\033[1;31m%s failure(s), %s warning(s).\033[0m\n' "${FAILS}" "${WARNS}"; fi
