@@ -98,7 +98,7 @@ The `.p8` is a team-wide, non-expiring signing key — whoever holds it can push
 | Layer | What the installer does |
 |---|---|
 | Separate user | The notifier runs as `analog-notifier`. `rnsd` and `lxmd` — the internet-facing daemons, user `reticulum` — **cannot read the key**. |
-| No code inside lxmd | The notifier is not an `on_inbound` hook (that hook only fires for lxmd's own inbox anyway). It watches `~reticulum/.lxmd/storage/messagestore` through a **read-only POSIX ACL** and reads only the 16-byte recipient-hash header lxmd itself writes at the front of each stored (ciphertext) message. It has no access to rnsd's or lxmd's identity files. |
+| No code inside lxmd | The notifier is not an `on_inbound` hook (that hook only fires for lxmd's own inbox anyway). It watches `~reticulum/.lxmd/storage/lxmf/messagestore` through a **read-only POSIX ACL** and reads only the 16-byte recipient-hash header lxmd itself writes at the front of each stored (ciphertext) message. It has no access to rnsd's or lxmd's identity files. |
 | Key at rest | On systemd ≥ 250 (Debian 12+, Ubuntu 24.04) each key is stored as a **`systemd-creds` encrypted credential** (`/etc/analog/apns_p8_<env>.cred`, root-only) bound to the host (TPM2 when present) and decrypted only into the service's private credentials mount. Elsewhere (Alpine, older systemd) it is `/etc/analog/apns_<env>.p8`, mode `0400`, owned by `analog-notifier`. |
 | Sandbox | The notifier unit runs with `ProtectSystem=strict`, no capabilities, `NoNewPrivileges`, a `@system-service` syscall filter, and IP/unix sockets only. |
 | JWT reuse | The provider JWT is cached for 50 min (Apple rejects tokens refreshed more often than every 20 min). |
@@ -106,6 +106,35 @@ The `.p8` is a team-wide, non-expiring signing key — whoever holds it can push
 Things only you can do: keep one APNs key per server so a compromised box means revoking one key; keep the `.p8` backed up off the host; put full-disk encryption on the VM; and if third parties will ever run propagation nodes, put the key behind a relay you operate rather than handing it out.
 
 `tokens.json` (`{lxmf_hash: apns_token}`) is low-sensitivity on its own — a device token is only useful together with the key. Until the RNS registration listener is implemented it is filled by hand.
+
+## Operating a node
+
+### Health check
+
+```
+curl -fsSLO https://raw.githubusercontent.com/Paydogs/rnsd/master/checkHealth.sh
+sudo sh checkHealth.sh
+```
+
+Walks every layer and prints one `PASS` / `WARN` / `FAIL` line per item: clock sync and disk; rnsd running, listening on its TCP port, interfaces up (`rnstatus`), identity files not world-readable; lxmd running with peers and store size (`lxmd --status`), recent `[Error]` lines; the notifier's user, its read-only ACL on the store (and that it *cannot* read rnsd's dir), each `[apns.<env>]` profile's completeness and key storage, the token DB, Python deps, and TLS reachability of both APNs hosts. Exit code is non-zero if anything `FAIL`ed, so it can be cron'd or used in monitoring.
+
+### Change the rnsd TCP port
+
+```
+sudo sh changeRnsPort.sh          # prompts, default 4242
+sudo sh changeRnsPort.sh 4242
+```
+
+Checks the port is free, backs up and rewrites `listen_port` for the `TCPServerInterface`, restarts rnsd and verifies the listener, and swaps the ufw rule if ufw is active. lxmd and the notifier reconnect on their own.
+
+### Useful commands
+
+```
+sudo -u reticulum rnstatus --config /var/lib/reticulum/.reticulum
+sudo -u reticulum lxmd --status --config /var/lib/reticulum/.lxmd --rnsconfig /var/lib/reticulum/.reticulum
+tail -f /var/lib/reticulum/.lxmd/logfile          # lxmd --service logs to a file, not the journal
+journalctl -u analog-notifier -f
+```
 
 ---
 

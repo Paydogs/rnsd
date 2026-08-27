@@ -101,7 +101,8 @@ NOTIFIER_LOG_DIR="${NOTIFIER_LOG_DIR:-/var/log/analog-notifier}"
 NOTIFIER_USER="${NOTIFIER_USER:-analog-notifier}"
 NOTIFIER_GROUP="${NOTIFIER_GROUP:-analog-notifier}"
 # lxmd's propagation message store — the notifier watches this read-only.
-LXMD_STORE_DIR="${LXMD_CONFIG_DIR}/storage/messagestore"
+# (LXMRouter appends /lxmf to lxmd's storage dir.)
+LXMD_STORE_DIR="${LXMD_CONFIG_DIR}/storage/lxmf/messagestore"
 # Where the APNs keys end up (one per environment, production|sandbox):
 #   encrypted systemd credential ${NOTIFIER_CONF_DIR}/apns_p8_<env>.cred (preferred)
 #   or 0400 file                 ${NOTIFIER_CONF_DIR}/apns_<env>.p8
@@ -628,7 +629,7 @@ def daemon(conf_path):
             continue
 
         store = Path(cp["notifier"].get("messagestore", "").strip()
-                     or "/var/lib/reticulum/.lxmd/storage/messagestore")
+                     or "/var/lib/reticulum/.lxmd/storage/lxmf/messagestore")
         try:
             entries = list(os.scandir(store))
         except OSError as e:
@@ -706,6 +707,12 @@ PYEOF
 write_notifier_conf() {
     if [ -f "${NOTIFIER_CONF_DIR}/notifier.conf" ]; then
         log "Keeping existing ${NOTIFIER_CONF_DIR}/notifier.conf"
+        # Migration: earlier versions pointed at .lxmd/storage/messagestore,
+        # which lxmd never uses (the real store is under storage/lxmf/).
+        if grep -q '^messagestore *= *.*/storage/messagestore *$' "${NOTIFIER_CONF_DIR}/notifier.conf"; then
+            warn "Fixing messagestore path in notifier.conf -> ${LXMD_STORE_DIR}"
+            sed -i "s|^messagestore *=.*|messagestore = ${LXMD_STORE_DIR}|" "${NOTIFIER_CONF_DIR}/notifier.conf"
+        fi
     else
         log "Writing ${NOTIFIER_CONF_DIR}/notifier.conf"
         cat > "${NOTIFIER_CONF_DIR}/notifier.conf" <<EOF
@@ -774,7 +781,7 @@ write_lxmd_config() {
 # See: lxmd --exampleconfig
 #
 # The Analog notifier does NOT use on_inbound (that hook only fires for
-# messages delivered to lxmd's own inbox). It watches storage/messagestore
+# messages delivered to lxmd's own inbox). It watches storage/lxmf/messagestore
 # read-only instead.
 
 [propagation]
@@ -1138,7 +1145,7 @@ prepare_notifier_dirs() {
 grant_store_access() {
     command -v setfacl >/dev/null 2>&1 || { err "setfacl not found (package 'acl'); cannot grant store access."; exit 1; }
     log "Granting ${NOTIFIER_USER} read-only ACL on ${LXMD_STORE_DIR}"
-    setfacl -m "u:${NOTIFIER_USER}:x"  "${RNS_HOME}" "${LXMD_CONFIG_DIR}" "${LXMD_CONFIG_DIR}/storage"
+    setfacl -m "u:${NOTIFIER_USER}:x"  "${RNS_HOME}" "${LXMD_CONFIG_DIR}" "${LXMD_CONFIG_DIR}/storage" "${LXMD_CONFIG_DIR}/storage/lxmf"
     setfacl -m "u:${NOTIFIER_USER}:rx" "${LXMD_STORE_DIR}"
     setfacl -d -m "u:${NOTIFIER_USER}:r" "${LXMD_STORE_DIR}"
     find "${LXMD_STORE_DIR}" -type f -exec setfacl -m "u:${NOTIFIER_USER}:r" {} +
@@ -1367,6 +1374,19 @@ install_notifier() {
     # ═══ PHASE 5 — Write service definitions (lxmd + notifier) ═════════════
     phase "Write service definitions (lxmd + notifier)"
     write_notifier_services
+    # rnsd installed by an older script has no UMask → its ratchets/identities
+    # are created world-readable. Add a drop-in and restart it (a few seconds;
+    # lxmd reconnects to the shared instance by itself).
+    if [ "$INIT" = systemd ] && [ -f /etc/systemd/system/rnsd.service ] \
+       && ! grep -q '^UMask=' /etc/systemd/system/rnsd.service \
+       && [ ! -f /etc/systemd/system/rnsd.service.d/umask.conf ]; then
+        log "Adding UMask=0027 drop-in to rnsd.service and restarting rnsd"
+        mkdir -p /etc/systemd/system/rnsd.service.d
+        printf '[Service]\nUMask=0027\n' > /etc/systemd/system/rnsd.service.d/umask.conf
+        systemctl daemon-reload
+        systemctl restart rnsd.service || warn "rnsd restart failed — check: journalctl -u rnsd -n 20"
+        chmod -R o-rwx "${RNS_HOME}"
+    fi
 
     # ═══ PHASE 6 — Enable + start + verify ═════════════════════════════════
     phase "Enable + start + verify"
