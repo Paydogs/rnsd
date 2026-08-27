@@ -213,7 +213,7 @@ cat > "${CONFIG_FILE}" <<EOF
     type = TCPServerInterface
     enabled = yes
     listen_ip = 0.0.0.0
-    listen_port = 7822
+    listen_port = 4242
 
   [[Beleth RNS Hub]]
     type = TCPClientInterface
@@ -339,13 +339,13 @@ cat <<EOF
 
  Configured interfaces:
    - AutoInterface        (LAN auto-discovery, link-local IPv6)
-   - TCPServerInterface   (listening on 0.0.0.0:7822)
+   - TCPServerInterface   (listening on 0.0.0.0:4242)
    - 5x TCPClientInterface  (Beleth, Ether Whisperer, Catz, RMAP, US-East)
    - 2x BackboneInterface   (bnZ-NODE01 Gothenburg, Pleiades Inc.)
 
- If you have a firewall (ufw/nftables/iptables), allow inbound TCP 7822
+ If you have a firewall (ufw/nftables/iptables), allow inbound TCP 4242
  so other peers can reach your TCPServerInterface, e.g.:
-   ufw allow 7822/tcp
+   ufw allow 4242/tcp
 ------------------------------------------------------------
 EOF
 

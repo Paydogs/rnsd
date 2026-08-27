@@ -1,0 +1,6 @@
+# Never commit APNs / signing material or per-host notifier state
+*.p8
+*.p12
+*.cred
+notifier.conf
+tokens.json

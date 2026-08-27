@@ -453,9 +453,9 @@ rnsconfig   = ${RNS_CONFIG_DIR}
 # Apple Developer: Keys > APNs Auth Key (.p8). Supply these to activate.
 team_id     = REPLACE_ME
 key_id      = REPLACE_ME
-bundle_id   = REPLACE_ME       # e.g. com.analog.app
+bundle_id   = REPLACE_ME
 key_path    = ${NOTIFIER_CONF_DIR}/AuthKey_REPLACE_ME.p8
-# api.push.apple.com (prod) or api.development.push.apple.com (sandbox).
+# api.push.apple.com or api.development.push.apple.com.
 host        = api.push.apple.com
 EOF
 chown "root:${RNS_GROUP}" "${NOTIFIER_CONF_DIR}/notifier.conf"
