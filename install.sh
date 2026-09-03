@@ -44,6 +44,13 @@
 #     PHASE 5 — Write service definitions (lxmd + notifier)
 #     PHASE 6 — Enable + start + verify
 #
+#   Both installers and --fix end by installing the helper scripts — the readers
+#   (checkHealth.sh, readLogs.sh, rnsdLog.sh, notifierLog.sh, listTokens.sh,
+#   reticulumStatus.sh) and the operators (restartRnsd.sh, restartLxmd.sh, clearLxmd.sh,
+#   editRnsConfig.sh, editLxmdConfig.sh, changeRnsPort.sh) — to /opt/rnsd-tools and onto
+#   the PATH — copied from beside install.sh when run from a checkout, fetched from the
+#   repo under `curl | sh`. See install_tools() and the TOOLS list.
+#
 #   APNs keys (separate step, once per environment, from a local copy of this
 #   script — never via curl | sh, the key must not travel with the installer):
 #     sudo sh install.sh --install-key AuthKey_<KEYID>.p8 --team-id <ID> \
@@ -104,6 +111,15 @@ NOTIFIER_GROUP="${NOTIFIER_GROUP:-analog-notifier}"
 # lxmd's propagation message store — the notifier watches this read-only.
 # (LXMRouter appends /lxmf to lxmd's storage dir.)
 LXMD_STORE_DIR="${LXMD_CONFIG_DIR}/storage/lxmf/messagestore"
+# The read-only helper scripts (health check, log readers, token list, port change) are
+# installed alongside the daemons so a node always carries the versions that match its
+# installer: copied from beside install.sh when run from a checkout, fetched from the repo
+# when run via `curl | sh`. Symlinked onto the PATH so `readLogs.sh -f` works from anywhere.
+TOOLS_DIR="${TOOLS_DIR:-/opt/rnsd-tools}"
+TOOLS_BIN_DIR="${TOOLS_BIN_DIR:-/usr/local/sbin}"
+TOOLS_BASE_URL="${TOOLS_BASE_URL:-https://raw.githubusercontent.com/Paydogs/rnsd/master}"
+TOOLS="checkHealth.sh readLogs.sh rnsdLog.sh notifierLog.sh listTokens.sh reticulumStatus.sh \
+restartRnsd.sh restartLxmd.sh clearLxmd.sh editRnsConfig.sh editLxmdConfig.sh changeRnsPort.sh"
 # Where the APNs keys end up (one per environment, production|sandbox):
 #   encrypted systemd credential ${NOTIFIER_CONF_DIR}/apns_p8_<env>.cred (preferred)
 #   or 0400 file                 ${NOTIFIER_CONF_DIR}/apns_<env>.p8
@@ -416,6 +432,30 @@ APNsRegistrationService.swift / DefaultReticulumService+IdentifiedRequest.swift)
                    {"error": "unidentified"} and nothing is stored.
   - Response     : JSON bytes {"ok": true, "changed": bool} or {"error": ...}
                    (errors: unidentified, bad token, bad bundle, bad request).
+  - Stored       : the token, its APNs env, and the proven identity's hash. The
+                   identity hash doubles as the phone's Reticulum transport id
+                   (Analog relays under its main identity), which is what the
+                   relay wake below matches against rnsd's path table.
+
+RELAY WAKE (relay_wake = yes)
+  A recipient in airplane mode never sees its push, but a phone next to it over
+  Bluetooth might — and once that phone is awake and back on TCP, rnsd forwards
+  the pending message through it. rnsd already knows who that phone is: its
+  path table holds "<recipient> via <next hop transport id>". So:
+  - A stored message still in the store relay_wake_delay_seconds after it
+    landed (the recipient has not fetched it) triggers a path-table lookup for
+    the recipient over rnsd's remote-management destination, authenticated
+    with this daemon's identity (rnsd config: enable_remote_management = Yes,
+    remote_management_allowed = <notifier identity hash>; transport_identity
+    in notifier.conf names rnsd's transport identity — install.sh wires both).
+  - If the next hop is a registered phone, it gets a *background* push
+    ({"aps": {"content-available": 1}, "analog": {"kind": "relay"}},
+    apns-push-type background, priority 5). No banner: the app reconnects,
+    re-announces, and stays up long enough for the forward to happen.
+  - At most relay_wake_max_attempts per message, one per next hop per
+    coalesce window. A stale path costs the neighbour one wasted wake.
+  Background pushes are rationed by iOS (a few per hour, deferred in Low
+  Power Mode), so this buys latency opportunistically, never correctness.
 
 TODO (before production)
   - Encrypted-envelope payload for the NSE (memo section 05). Today the push
@@ -567,6 +607,19 @@ def load_tokens(cp):
     return out
 
 
+def load_relays(cp):
+    """{identity_hash_hex: (lxmf_hash, token, env)} for every registration that recorded its
+    identity — the phones a relay wake can address. Older entries (pre-identity) are simply
+    absent until that phone re-registers, which it does on every launch."""
+    out = {}
+    for lxmf_hash, entry in load_tokens_raw(cp).items():
+        if not isinstance(entry, dict) or not entry.get("token") or not entry.get("identity"):
+            continue
+        out[str(entry["identity"]).lower()] = (lxmf_hash.lower(), entry["token"],
+                                               entry.get("env", "production"))
+    return out
+
+
 def token_db_file(cp):
     return Path(cp["notifier"].get("token_db", "/var/lib/analog-notifier/tokens.json"))
 
@@ -674,12 +727,17 @@ class Registrar:
             log(f"/register from {h[:8]}…: bad bundle '{bundle}'")
             return {"error": "bad bundle"}
 
+        # The identity hash is the phone's transport id when it relays (Analog enables transport
+        # under its main identity), so it is what rnsd's path table names as a next hop.
+        identity = remote_identity.hash.hex()
         prev = raw.get(h)
         prev_tok = prev if isinstance(prev, str) else (prev or {}).get("token")
         prev_env = "production" if isinstance(prev, str) else (prev or {}).get("env")
-        changed = (prev_tok != token) or (prev_env != env)
+        prev_identity = None if isinstance(prev, str) else (prev or {}).get("identity")
+        changed = (prev_tok != token) or (prev_env != env) or (prev_identity != identity)
         if changed:
-            raw[h] = {"token": token, "env": env, "bundle_id": bundle, "updated": int(time.time())}
+            raw[h] = {"token": token, "env": env, "bundle_id": bundle, "identity": identity,
+                      "updated": int(time.time())}
             save_tokens_atomic(self.cp, raw)
         if env not in configured_envs(self.cp):
             log(f"registered {h[:8]}… for {env} — NOTE: that environment is not configured on this node")
@@ -721,22 +779,33 @@ class Apns:
             self._client = httpx.Client(http2=True, timeout=15)
         return self._client
 
-    def send(self, device_token, recipient_hash):
+    def send(self, device_token, recipient_hash, kind="mail"):
         a = profile(self.cp, self.env)
         host = a.get("host", "").strip() or DEFAULT_HOST[self.env]
-        # TODO (memo section 05): carry the E2E-encrypted envelope here.
-        # content-available:1 is what makes iOS launch the app in the background
-        # (remote-notification mode -> didReceiveRemoteNotification -> sync from
-        # the propagation node). mutable-content:1 routes it through the NSE so
-        # the text can later be derived from an encrypted envelope.
-        payload = {"aps": {"content-available": 1,
-                           "mutable-content": 1,
-                           "alert": {"title": "Analog", "body": "New message"}}}
+        # The "analog" key names the wake for the app. "mail": sync your own inbox.
+        # "relay": a neighbour's mail is waiting — reconnect and stay up so rnsd can
+        # forward through you (see RELAY WAKE). The relay push is a true background
+        # push: no alert, so nothing shows on the relaying phone, at the price of
+        # iOS rationing it (a few per hour; deferred in Low Power Mode).
+        if kind == "relay":
+            payload = {"aps": {"content-available": 1}, "analog": {"kind": "relay"}}
+            push_type, priority = "background", "5"
+        else:
+            # TODO (memo section 05): carry the E2E-encrypted envelope here.
+            # content-available:1 is what makes iOS launch the app in the background
+            # (remote-notification mode -> didReceiveRemoteNotification -> sync from
+            # the propagation node). mutable-content:1 routes it through the NSE so
+            # the text can later be derived from an encrypted envelope.
+            payload = {"aps": {"content-available": 1,
+                               "mutable-content": 1,
+                               "alert": {"title": "Analog", "body": "New message"}},
+                       "analog": {"kind": "mail"}}
+            push_type, priority = "alert", "10"
         headers = {
             "authorization": f"bearer {self._token()}",
             "apns-topic": a["bundle_id"].strip(),
-            "apns-push-type": "alert",
-            "apns-priority": "10",
+            "apns-push-type": push_type,
+            "apns-priority": priority,
         }
         try:
             r = self._http().post(f"https://{host}/3/device/{device_token}",
@@ -746,12 +815,109 @@ class Apns:
             self._client = None
             return False
         if r.status_code == 200:
-            log(f"APNs ping sent for {recipient_hash[:8]}… ({self.env})")
+            # Keep the "APNs ping sent for" prefix: notifierLog.sh tags PUSH on it.
+            log(f"APNs ping sent for {recipient_hash[:8]}… ({self.env}, {kind})")
             return True
-        log(f"APNs {r.status_code} for {recipient_hash[:8]}… ({self.env}): {r.text.strip()}")
+        log(f"APNs {r.status_code} for {recipient_hash[:8]}… ({self.env}, {kind}): {r.text.strip()}")
         if r.status_code == 403:      # ExpiredProviderToken / InvalidProviderToken
             self._jwt = None
         return False
+
+
+# --- rnsd path table (relay wake) -------------------------------------------
+
+class TransportTable:
+    """Asks rnsd which transport it would forward a destination through.
+
+    Goes over rnsd's remote-management destination (rnstransport.remote.management, derived from
+    its transport identity) on an identified link, exactly as `rnpath -R` does. The notifier's
+    own RNS instance cannot answer this itself: as a shared-instance client it only ever sees
+    rnsd as the next hop for everything. Failures back off rather than retry every poll — a
+    dead link here must not stall the ordinary pings sharing this thread.
+    """
+    LINK_TIMEOUT = 15
+    RETRY_BACKOFF = 60
+
+    def __init__(self, cp, ident):
+        import RNS
+        self.RNS = RNS
+        self.cp = cp
+        self.ident = ident
+        self.link = None
+        self.next_try = 0.0
+        self.last_warning = 0.0
+
+    def transport_identity(self):
+        return self.cp["notifier"].get("transport_identity", "").strip().lower()
+
+    def _connect(self):
+        RNS = self.RNS
+        tid = bytes.fromhex(self.transport_identity())
+        mgmt = RNS.Destination.hash_from_name_and_identity("rnstransport.remote.management", tid)
+        if not RNS.Transport.has_path(mgmt):
+            RNS.Transport.request_path(mgmt)
+            t0 = time.time()
+            while not RNS.Transport.has_path(mgmt):
+                time.sleep(0.1)
+                if time.time() - t0 > self.LINK_TIMEOUT:
+                    raise RuntimeError("path request to rnsd's management destination timed out")
+        remote = RNS.Identity.recall(mgmt)
+        if remote is None:
+            raise RuntimeError("rnsd's management identity could not be recalled")
+        dest = RNS.Destination(remote, RNS.Destination.OUT, RNS.Destination.SINGLE,
+                               "rnstransport", "remote", "management")
+        link = RNS.Link(dest)
+        t0 = time.time()
+        while link.status != RNS.Link.ACTIVE:
+            time.sleep(0.1)
+            if time.time() - t0 > self.LINK_TIMEOUT:
+                link.teardown()
+                raise RuntimeError("link to rnsd's management destination timed out")
+        link.identify(self.ident)
+        link.set_link_closed_callback(self._closed)
+        self.link = link
+        log("path-table link to rnsd established (relay wake active)")
+
+    def _closed(self, link):
+        self.link = None
+
+    def next_hop(self, dest_hex):
+        """Hex transport id rnsd forwards `dest_hex` through, or None (no path, direct, or
+        the table could not be read right now)."""
+        now = time.time()
+        if self.link is None:
+            if now < self.next_try:
+                return None
+            try:
+                self._connect()
+            except Exception as e:
+                self.next_try = now + self.RETRY_BACKOFF
+                if now - self.last_warning > DORMANT_LOG_EVERY:
+                    log(f"relay wake: cannot read rnsd's path table ({e}) — is remote management "
+                        "enabled for the notifier identity? (install.sh --fix)")
+                    self.last_warning = now
+                return None
+        dest = bytes.fromhex(dest_hex)
+        try:
+            receipt = self.link.request("/path", data=["table", dest, None], timeout=self.LINK_TIMEOUT)
+            t0 = time.time()
+            while not receipt.concluded():
+                time.sleep(0.05)
+                if time.time() - t0 > self.LINK_TIMEOUT:
+                    return None
+            response = receipt.get_response()
+        except Exception as e:
+            log(f"relay wake: path-table request failed ({e}); reconnecting later")
+            self.link = None
+            self.next_try = now + self.RETRY_BACKOFF
+            return None
+        if not response:
+            # None on auth failure too (the identity is not in remote_management_allowed).
+            return None
+        for path in response:
+            if path.get("hash") == dest and isinstance(path.get("via"), bytes):
+                return path["via"].hex()
+        return None
 
 
 # --- notifier core ----------------------------------------------------------
@@ -766,6 +932,74 @@ class Notifier:
         self.deferred = set()      # hashes that got mail inside the window; pinged when it closes
         self.unknown = 0           # stored messages for recipients without a token
         self.last_summary = time.time()
+        self.table = None          # TransportTable, when relay wake is on
+        self.pending = {}          # store file name -> {"h", "attempts", "due"} awaiting fetch
+        self.last_relay_ping = {}  # next-hop identity -> last relay push time (coalescing)
+
+    def relay_enabled(self):
+        return (self.cp is not None
+                and self.cp["notifier"].get("relay_wake", "yes").strip().lower() in ("yes", "true", "1", "on")
+                and self.table is not None
+                and bool(self.table.transport_identity()))
+
+    def track(self, name, h):
+        """Remember a freshly stored message so the relay sweep can act if it is not fetched."""
+        if not self.relay_enabled() or name in self.pending:
+            return
+        delay = float(self.cp["notifier"].get("relay_wake_delay_seconds", "60"))
+        self.pending[name] = {"h": h.lower(), "attempts": 0, "due": time.time() + delay}
+
+    def relay_sweep(self, present):
+        """Wake the next hop toward every recipient whose mail is still sitting in the store.
+
+        A file that vanished was fetched — the recipient came for it on its own, so nothing to
+        do. One that is still there past its due time gets rnsd's next hop looked up; a
+        registered phone there is pushed, at most `relay_wake_max_attempts` times per message
+        and once per coalesce window per neighbour.
+        """
+        if not self.pending:
+            return
+        for name in [n for n in self.pending if n not in present]:
+            del self.pending[name]
+        if not self.relay_enabled():
+            self.pending.clear()
+            return
+        now = time.time()
+        delay = float(self.cp["notifier"].get("relay_wake_delay_seconds", "60"))
+        max_attempts = int(self.cp["notifier"].get("relay_wake_max_attempts", "2"))
+        window = int(self.cp["notifier"].get("coalesce_window_seconds", "60"))
+        relays = None
+        for name, entry in list(self.pending.items()):
+            if now < entry["due"]:
+                continue
+            entry["attempts"] += 1
+            entry["due"] = now + delay
+            if entry["attempts"] > max_attempts:
+                del self.pending[name]
+                continue
+            h = entry["h"]
+            via = self.table.next_hop(h)
+            if via is None or via == h:
+                continue
+            if relays is None:
+                relays = load_relays(self.cp)
+            hop = relays.get(via)
+            if hop is None:
+                continue
+            hop_lxmf, token, env = hop
+            if hop_lxmf == h:
+                continue
+            if now - self.last_relay_ping.get(via, 0) < window:
+                continue
+            apns = self.apns.get(env)
+            if apns is None:
+                continue
+            self.last_relay_ping[via] = now
+            log(f"relay wake: {h[:8]}… unfetched, next hop {via[:8]}… is registered — pushing it")
+            apns.send(token, h, kind="relay")
+        if len(self.last_relay_ping) > 10000:
+            cutoff = now - window
+            self.last_relay_ping = {k: v for k, v in self.last_relay_ping.items() if v >= cutoff}
 
     def reload(self):
         """Re-read the config when it changes on disk (no restart needed)."""
@@ -856,8 +1090,15 @@ def daemon(conf_path):
             # retried in-process. Exit non-zero and let the service manager retry.
             log(f"registration listener failed to start: {e} — exiting for restart")
             sys.exit(1)
+        # Relay wake rides the same RNS instance; it connects to rnsd lazily on first use.
+        n.table = TransportTable(cp0, ident)
+        if n.table.transport_identity():
+            log("relay wake enabled (rnsd transport identity "
+                f"{n.table.transport_identity()[:8]}…)")
+        else:
+            log("relay wake off: transport_identity not set in notifier.conf (run: install.sh --fix)")
     else:
-        log("registration disabled in notifier.conf (registration = no)")
+        log("registration disabled in notifier.conf (registration = no); relay wake off too")
     started = time.time()
     seen = set()
     last_dormant_log = 0.0
@@ -869,6 +1110,8 @@ def daemon(conf_path):
         if registrar is not None:
             registrar.cp = cp or registrar.cp
             registrar.announce_if_due()
+        if n.table is not None:
+            n.table.cp = cp or n.table.cp
         if cp is None or not configured_envs(cp):
             if time.time() - last_dormant_log > DORMANT_LOG_EVERY:
                 if cp is None:
@@ -913,8 +1156,10 @@ def daemon(conf_path):
             seen.add(e.name)
             if h:
                 n.ping(h)
+                n.track(e.name, h)
         seen &= present
         n.flush_deferred()
+        n.relay_sweep(present)
         if time.time() - n.last_summary > DORMANT_LOG_EVERY:
             if n.unknown:
                 log(f"{n.unknown} stored message(s) for unregistered recipients "
@@ -1005,6 +1250,16 @@ coalesce_window_seconds = 60
 # lxmd propagation message store to watch (read-only, via ACL).
 messagestore = ${LXMD_STORE_DIR}
 poll_interval_seconds = 2
+# Relay wake: when a stored message is still unfetched after the delay, look the
+# recipient up in rnsd's path table and send its next hop (if it is a registered
+# phone) a silent background push, so it reconnects and rnsd can forward
+# through it — the offline-over-Bluetooth case. Needs rnsd remote management
+# for the notifier identity and rnsd's transport identity below; both are
+# filled by the installer / --fix.
+relay_wake = yes
+relay_wake_delay_seconds = 60
+relay_wake_max_attempts = 2
+transport_identity =
 
 # One profile per APNs environment. A device token only works against the
 # environment its build was signed for, so tokens.json records the env of
@@ -1522,6 +1777,7 @@ install_rnsd() {
     svc_restart_or_start "${SERVICE_NAME}"
     sleep 2
     svc_status "${SERVICE_NAME}" || true
+    install_tools
 
     # Banner — only the service/log/command wording differs by init system.
     if [ "$INIT" = systemd ]; then
@@ -1558,6 +1814,12 @@ install_rnsd() {
    ${n_cmd_restart}
    ${n_cmd_stop}
    ${n_cmd_logs}
+
+ Helper scripts (installed to ${TOOLS_DIR}, on the PATH):
+   checkHealth.sh          every link in the chain, with fixes named
+   reticulumStatus.sh      rnstatus as the service user (--paths, --lxmd)
+   rnsdLog.sh -f           tagged rnsd log; readLogs.sh -f merges it with the notifier's
+   restartRnsd.sh          restart the chain (rnsd, lxmd, notifier); editRnsConfig.sh edits, then restarts
 
  Edit the config, then restart the service:
    \$EDITOR ${CONFIG_FILE}
@@ -1684,12 +1946,15 @@ install_notifier() {
     fi
 
     set_propagation_node
+    ensure_remote_management
+    set_transport_identity
     log "Starting ${NOTIFIER_NAME} (pings dormant until an APNs key is installed; registration listener live)..."
     svc_restart "${NOTIFIER_NAME}" || svc_start "${NOTIFIER_NAME}" || true
 
     sleep 2
     svc_status lxmd || true
     svc_status "${NOTIFIER_NAME}" || true
+    install_tools
 
     # Banner — only service/log/command wording differs by init system.
     if [ "$INIT" = systemd ]; then
@@ -1722,6 +1987,9 @@ install_notifier() {
    logs                  : ${n_logs_l1}
                             ${n_logs_l2}
    node status           : sudo -u ${RNS_USER} lxmd --status --config ${LXMD_CONFIG_DIR} --rnsconfig ${RNS_CONFIG_DIR}
+   helper scripts        : ${TOOLS_DIR} (on the PATH) — checkHealth.sh, readLogs.sh -f,
+                            notifierLog.sh, rnsdLog.sh, listTokens.sh, reticulumStatus.sh,
+                            restartLxmd.sh, clearLxmd.sh, editLxmdConfig.sh
 
  NEXT STEP — install the APNs key(s). The notifier is dormant until at
  least one environment is configured; configure both to serve production
@@ -1751,6 +2019,59 @@ EOF
 }
 
 gen_rpc_key() { python3 -c 'import secrets; print(secrets.token_hex(32))'; }
+
+# Download one URL to a file with whatever the host has. Returns non-zero when neither
+# curl nor wget exists or the transfer fails; the caller decides what that costs.
+fetch_url() {
+    # Quiet on failure: the caller reports what was missed in one line.
+    if command -v curl >/dev/null 2>&1; then curl -fsL -o "$2" "$1" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1" 2>/dev/null
+    else return 1; fi
+}
+
+# Install the helper scripts into TOOLS_DIR and put them on the PATH. Runs at the end of
+# every install mode and of --fix, so the scripts on a node are always the ones that
+# match its installer. Source preference: a sibling of this very file when install.sh is
+# a real file on disk next to its repo siblings (a checkout — a locally modified script is
+# deployed as is, and it works offline); otherwise the repo at TOOLS_BASE_URL. Each file is
+# syntax-checked before it replaces the previous one, and a fetch failure keeps what was
+# there — these are conveniences, never worth failing an install over. Idempotent.
+TOOLS_INSTALLED=0
+install_tools() {
+    [ "${TOOLS_INSTALLED}" -eq 1 ] && return 0
+    TOOLS_INSTALLED=1
+    log "Installing helper scripts to ${TOOLS_DIR} (on PATH via ${TOOLS_BIN_DIR})"
+    mkdir -p "${TOOLS_DIR}" "${TOOLS_BIN_DIR}"
+    src_dir=""
+    if [ -f "$0" ]; then
+        src_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+        # Only trust the directory as a checkout if the installer itself lives there too;
+        # `sh -` / `curl | sh` leave $0 as the shell name and would otherwise scan the cwd.
+        [ -f "${src_dir}/install.sh" ] || src_dir=""
+        [ "${src_dir}" = "${TOOLS_DIR}" ] && src_dir=""
+    fi
+    installed=""; missed=""
+    for t in ${TOOLS}; do
+        tmp="${TOOLS_DIR}/.${t}.tmp"
+        if [ -n "${src_dir}" ] && [ -f "${src_dir}/${t}" ]; then
+            cp "${src_dir}/${t}" "${tmp}" || { missed="${missed} ${t}"; rm -f "${tmp}"; continue; }
+        elif ! fetch_url "${TOOLS_BASE_URL}/${t}" "${tmp}"; then
+            missed="${missed} ${t}"; rm -f "${tmp}"; continue
+        fi
+        if ! sh -n "${tmp}" 2>/dev/null; then
+            warn "${t} failed its syntax check — keeping the previous copy"
+            rm -f "${tmp}"; missed="${missed} ${t}"; continue
+        fi
+        mv "${tmp}" "${TOOLS_DIR}/${t}"
+        chown root:root "${TOOLS_DIR}/${t}"; chmod 755 "${TOOLS_DIR}/${t}"
+        ln -sfn "${TOOLS_DIR}/${t}" "${TOOLS_BIN_DIR}/${t}"
+        installed="${installed} ${t}"
+    done
+    origin="${src_dir:-${TOOLS_BASE_URL}}"
+    [ -n "${installed}" ] && log "helper scripts:${installed} (from ${origin})"
+    [ -n "${missed}" ] && warn "helper scripts not updated:${missed} — re-run install.sh --fix with network access, or copy them to ${TOOLS_DIR} by hand"
+    return 0
+}
 
 # Restart rnsd and lxmd (both read the rnsd config; an rpc_key change must
 # reach both). lxmd reconnects to the shared instance by itself.
@@ -1847,6 +2168,65 @@ ensure_notifier_identity() {
         || { err "could not create the notifier identity:"; printf '%s\n' "${NOTIFIER_ID_OUT}" >&2; exit 1; }
     printf '%s\n' "${NOTIFIER_ID_OUT}" | sed 's/^/    /'
     NOTIFIER_REG_HASH="$(printf '%s\n' "${NOTIFIER_ID_OUT}" | sed -n 's/^registration destination : \([0-9a-f]*\).*/\1/p')"
+    NOTIFIER_ID_HASH="$(printf '%s\n' "${NOTIFIER_ID_OUT}" | sed -n 's/^identity hash *: \([0-9a-f]*\).*/\1/p')"
+}
+
+# Relay wake needs the notifier to read rnsd's path table. rnsd exposes it over
+# its remote-management destination to an allow-list of identities; put the
+# notifier's identity on that list (keeping any the operator added) and turn the
+# feature on. Restarts the stack only when something actually changed.
+# Caller sets NOTIFIER_ID_HASH (ensure_notifier_identity).
+ensure_remote_management() {
+    cfg="${RNS_CONFIG_DIR}/config"
+    if [ -z "${NOTIFIER_ID_HASH}" ]; then
+        warn "notifier identity hash unknown — rnsd remote management left as is; re-run: install.sh --fix"
+        return 0
+    fi
+    changed=0
+    if ! grep -q '^[[:space:]]*enable_remote_management[[:space:]]*=[[:space:]]*[Yy]' "${cfg}"; then
+        sed -i '/^[[:space:]]*enable_remote_management[[:space:]]*=/d' "${cfg}"
+        sed -i "s|^\[reticulum\][[:space:]]*$|[reticulum]\n  # Remote management: lets the analog-notifier read the path table for relay wakes (added by install.sh).\n  enable_remote_management = Yes|" "${cfg}"
+        changed=1
+    fi
+    if grep -q '^[[:space:]]*remote_management_allowed[[:space:]]*=' "${cfg}"; then
+        if ! grep -q "^[[:space:]]*remote_management_allowed[[:space:]]*=.*${NOTIFIER_ID_HASH}" "${cfg}"; then
+            sed -i "s|^\([[:space:]]*remote_management_allowed[[:space:]]*=.*\)$|\1, ${NOTIFIER_ID_HASH}|" "${cfg}"
+            changed=1
+        fi
+    else
+        sed -i "s|^\[reticulum\][[:space:]]*$|[reticulum]\n  remote_management_allowed = ${NOTIFIER_ID_HASH}|" "${cfg}"
+        changed=1
+    fi
+    if [ "${changed}" -eq 1 ]; then
+        grep -q "^[[:space:]]*remote_management_allowed[[:space:]]*=.*${NOTIFIER_ID_HASH}" "${cfg}" || {
+            err "could not add the notifier identity to remote_management_allowed in ${cfg}"; exit 1; }
+        log "rnsd remote management enabled for the notifier identity ${NOTIFIER_ID_HASH}"
+        restart_rns_stack
+    else
+        log "rnsd remote management already allows the notifier identity"
+    fi
+}
+
+# Record rnsd's transport identity hash in notifier.conf: the relay wake derives
+# rnsd's management destination from it. rnsd creates the file on first start.
+set_transport_identity() {
+    tf="${RNS_CONFIG_DIR}/storage/transport_identity"
+    i=0
+    while [ ! -f "${tf}" ] && [ $i -lt 15 ]; do i=$((i + 1)); sleep 1; done
+    if [ ! -f "${tf}" ]; then
+        warn "rnsd transport identity not present yet — transport_identity left empty; re-run: install.sh --fix"
+        return 0
+    fi
+    tid="$(su -s /bin/sh "${RNS_USER}" -c "python3 -c \"
+import RNS
+print(RNS.Identity.from_file('${tf}').hash.hex())\"" 2>/dev/null)"
+    if [ -n "${tid}" ]; then
+        conf_ensure_key transport_identity ""
+        conf_set notifier transport_identity "${tid}"
+        log "transport_identity = ${tid}"
+    else
+        warn "could not derive rnsd's transport identity hash — re-run: install.sh --fix"
+    fi
 }
 
 # ============================================================================
@@ -1870,6 +2250,28 @@ Usage: install.sh --install-key FILE --env production|sandbox
 Run once per environment. Each key is stored so that only the
 ${NOTIFIER_NAME} service can read it; the matching [apns.<env>] block in
 ${NOTIFIER_CONF_DIR}/notifier.conf is filled and the service restarted.
+EOF
+}
+
+# The helper scripts install_tools() puts on the PATH, one line each. Printed at the end of
+# --help so the next command after an install is never a guess.
+usage_tools() {
+    cat <<EOF
+
+Helper commands (installed to ${TOOLS_DIR}, on the PATH via ${TOOLS_BIN_DIR}; each has --help):
+  checkHealth.sh          every link in the chain checked, with the fix named for each failure
+  readLogs.sh [-f]        notifier + rnsd logs merged in time order, tagged by source
+  rnsdLog.sh [-f]         rnsd log tagged by level and topic (--only problems|interfaces|announces|paths|links)
+  notifierLog.sh [-f]     notifier log tagged: registrations, pushes, relay wakes, refusals
+  listTokens.sh           APNs registrations the notifier holds (who can be woken)
+  reticulumStatus.sh      rnstatus + lxmd --status as the service user (--paths for the path table)
+  restartRnsd.sh          restart the chain in order: notifier and lxmd down, rnsd, then up again
+  restartLxmd.sh          restart lxmd and the notifier, then print lxmd's status
+  clearLxmd.sh            forget the learned network (path table, tunnels, lxmd peers) and restart;
+                          --messages also empties the message store (asks unless --yes)
+  editRnsConfig.sh        edit rnsd's config (backup kept), restart the chain if it changed
+  editLxmdConfig.sh       edit lxmd's config (backup kept), restart lxmd if it changed
+  changeRnsPort.sh [PORT] move the TCPServerInterface to another port and restart
 EOF
 }
 
@@ -2052,7 +2454,7 @@ EOF
 install_fix() {
     log "==> Repair / update (${PM} / ${INIT})"
     PHASE_NUM=0
-    PHASE_TOTAL=4
+    PHASE_TOTAL=5
     check_rnsd_present
 
     # ═══ PHASE 1 — Permissions ═════════════════════════════════════════════
@@ -2130,10 +2532,15 @@ install_fix() {
         conf_ensure_key rns_config "${NOTIFIER_STATE_DIR}/rns"
         conf_ensure_key registration yes
         conf_ensure_key announce_interval_seconds 300
+        conf_ensure_key relay_wake yes
+        conf_ensure_key relay_wake_delay_seconds 60
+        conf_ensure_key relay_wake_max_attempts 2
         ensure_rpc_key
         write_notifier_rns_config
         ensure_notifier_identity
         set_propagation_node
+        ensure_remote_management
+        set_transport_identity
         write_notifier_services
         svc_reload
         svc_restart "${NOTIFIER_NAME}" || svc_start "${NOTIFIER_NAME}" || warn "${NOTIFIER_NAME} restart failed"
@@ -2145,7 +2552,11 @@ install_fix() {
         log "Notifier not installed here — skipping (install it with option 3)."
     fi
 
-    # ═══ PHASE 4 — Verify ══════════════════════════════════════════════════
+    # ═══ PHASE 4 — Helper scripts ══════════════════════════════════════════
+    phase "Helper scripts"
+    install_tools
+
+    # ═══ PHASE 5 — Verify ══════════════════════════════════════════════════
     phase "Verify"
     sleep 2
     for svc in rnsd lxmd "${NOTIFIER_NAME}"; do
@@ -2158,9 +2569,11 @@ install_fix() {
     cat <<EOF
 
 ------------------------------------------------------------
- Repair complete. Nothing in your configs or keys was changed except the
- notifier's messagestore path (if it was stale).
- Run the health check:  sh checkHealth.sh
+ Repair complete. Your keys and lxmd config were not touched. In the RNS
+ config only the relay-wake wiring may have been added (remote management
+ for the notifier identity); in notifier.conf only missing keys were added.
+ Helper scripts are in ${TOOLS_DIR} and on the PATH.
+ Run the health check:  checkHealth.sh
 ------------------------------------------------------------
 EOF
 }
@@ -2302,6 +2715,7 @@ main() {
         -h|--help)
             sed -n '2,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
             usage_install_key
+            usage_tools
             exit 0 ;;
     esac
 

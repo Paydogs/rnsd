@@ -82,8 +82,17 @@ if [ -f "${RNS_CONFIG_DIR}/config" ]; then
     port="$(awk '/^[[:space:]]*\[\[/{s=0} /type[[:space:]]*=[[:space:]]*TCPServerInterface/{s=1} s&&/listen_port[[:space:]]*=/{sub(/.*=[[:space:]]*/,"");print;exit}' "${RNS_CONFIG_DIR}/config")"
     if [ -n "${port}" ]; then
         if command -v ss >/dev/null 2>&1; then
-            if ss -tlnp 2>/dev/null | grep ":${port} " | grep -q rnsd; then pass "TCPServerInterface listening on TCP ${port}"
-            else fail "TCPServerInterface should listen on TCP ${port} but nothing is bound"; fi
+            # rnsd is a Python script, so the process ss names is "python3", never "rnsd" —
+            # matching on the name reported "nothing is bound" against a server with six
+            # clients. Match the service's own PID instead, and fall back to "something owns
+            # the port" where the PID is unknown (OpenRC).
+            listener="$(ss -tlnp 2>/dev/null | grep ":${port} ")"
+            rnsd_pid=""
+            [ "$INIT" = systemd ] && rnsd_pid="$(systemctl show -p MainPID --value rnsd.service 2>/dev/null)"
+            if [ -z "${listener}" ]; then fail "TCPServerInterface should listen on TCP ${port} but nothing is bound"
+            elif [ -n "${rnsd_pid}" ] && [ "${rnsd_pid}" != 0 ] && ! printf '%s' "${listener}" | grep -q "pid=${rnsd_pid},"; then
+                fail "TCP ${port} is bound, but not by rnsd (pid ${rnsd_pid}) — another process holds the port"
+            else pass "TCPServerInterface listening on TCP ${port}"; fi
         else warn "'ss' not available; cannot verify TCP ${port} listener"; fi
     else warn "no TCPServerInterface in ${RNS_CONFIG_DIR}/config (inbound peers cannot reach this node)"; fi
 else
@@ -187,6 +196,16 @@ else pass "rpc_key shared between rnsd and the notifier"; fi
 if [ "$INIT" = systemd ] && journalctl -u "${NOTIFIER_NAME}" -n 200 --no-pager -o cat 2>/dev/null | grep -q 'digest sent was rejected'; then
     warn "recent 'digest sent was rejected' RPC errors in the notifier journal — if they persist after --fix + restart, the rpc_keys are out of sync"
 fi
+# Relay wake: the notifier reads rnsd's path table over remote management, so rnsd must
+# allow the notifier identity and the notifier must know rnsd's transport identity.
+if grep -q '^[[:space:]]*enable_remote_management[[:space:]]*=[[:space:]]*[Yy]' "${RNS_CONFIG_DIR}/config" 2>/dev/null; then
+    pass "rnsd remote management enabled (relay wake can read the path table)"
+else
+    warn "rnsd remote management is off — relay wake disabled; run: install.sh --fix"
+fi
+tid_conf="$(conf_get notifier transport_identity)"
+if [ -n "${tid_conf}" ]; then pass "notifier knows rnsd's transport identity (${tid_conf})"
+else warn "transport_identity not set in notifier.conf — relay wake disabled; run: install.sh --fix"; fi
 if [ -n "${NOTIFIER_REG}" ] && command -v rnpath >/dev/null 2>&1 && svc_active rnsd; then
     if timeout 20 su -s /bin/sh "${RNS_USER}" -c "rnpath --config '${RNS_CONFIG_DIR}' -t" 2>/dev/null | grep -qi "${NOTIFIER_REG}"; then
         pass "registration destination is announced (present in rnsd's path table)"
