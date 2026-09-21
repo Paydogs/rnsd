@@ -27,6 +27,7 @@ Select what to install:
   2) rnsd only
   3) Analog notifier only    (requires rnsd already installed)   [rnsd detected]
   4) Repair / update existing install (permissions, ACL, code — keeps configs + keys)
+  5) Update rns + lxmf packages and restart services (touches nothing else)
 Enter choice [3]:
 ```
 
@@ -46,7 +47,7 @@ sudo bash install.sh
 
 Non-interactive (for `curl | sh` / CI — skips the prompts):
 ```
-# RNS_ENV=apt|apk               RNS_INSTALL=full|rnsd|notifier|fix
+# RNS_ENV=apt|apk               RNS_INSTALL=full|rnsd|notifier|fix|update
 # (legacy: RNS_NOTIFIER=yes|no  → yes=full, no=rnsd)
 curl -fsSL https://raw.githubusercontent.com/Paydogs/rnsd/master/install.sh | RNS_ENV=apt RNS_INSTALL=full sudo -E bash
 
@@ -55,6 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/Paydogs/rnsd/master/install.sh | RN
 #   Alpine, rnsd only:                 RNS_ENV=apk RNS_INSTALL=rnsd
 #   add the notifier to an rnsd host:  RNS_ENV=apt RNS_INSTALL=notifier
 #   repair after an upgrade:           RNS_ENV=apt RNS_INSTALL=fix
+#   upgrade rns + lxmf only:           RNS_ENV=apt RNS_INSTALL=update
 ```
 
 Or on the server itself, non-interactively from a downloaded copy:
@@ -63,6 +65,8 @@ ssh admin@node.example.com
 curl -fsSLO https://raw.githubusercontent.com/Paydogs/rnsd/master/install.sh
 sudo RNS_ENV=apt RNS_INSTALL=full sh install.sh
 ```
+
+**Reticulum version.** `RNS_VERSION` near the top of `install.sh` (default `1.5.2`) pins the `rns` release that every mode installs; `LXMF_VERSION` does the same for `lxmf` (empty = latest). Set either one to empty to always get the latest, or override it for one run: `sudo RNS_VERSION=1.5.4 sh install.sh --update`.
 
 Each install runs in clearly marked phases (6 for rnsd, 6 for the notifier) printed live as it goes; the same phase structure is used on both OSes.
 
@@ -276,6 +280,14 @@ sudo sh install.sh --fix        # or: menu option 4, or RNS_INSTALL=fix
 ```
 
 Non-interactive. Brings a node installed by an earlier version up to the current layout **without touching** the lxmd config, existing `notifier.conf` values or the APNs keys: strips world-read access from `/var/lib/reticulum`, adds `UMask=0027` to the rnsd/lxmd units, migrates a stale `messagestore` path, re-applies the notifier's read-only ACL, fixes ownership of keys/state, and refreshes the notifier code + service definition (the key drop-ins are preserved). The one thing it does add to the RNS config is the relay-wake wiring: `enable_remote_management = Yes` plus the notifier's identity in `remote_management_allowed` (rnsd and lxmd restart once when that changes), and `transport_identity` in `notifier.conf`. Run `checkHealth.sh` afterwards; if it reports something fixable, `--fix` is the intended remedy.
+
+### Updating rns + lxmf
+
+```
+sudo sh install.sh --update     # or: menu option 5, or RNS_INSTALL=update
+```
+
+Brings `rns` and `lxmf` to `RNS_VERSION` / `LXMF_VERSION` with pip (the same way the installer put them there, downgrading if the pin is lower) and, only if a version changed, restarts rnsd, lxmd and the notifier in that order. It doesn't touch any config, unit, key or helper script. Don't re-run the rnsd install to upgrade: it rewrites the RNS config from the template (keeping a `.bak`). If you also pulled a newer `install.sh`, run `--fix` afterwards.
 
 Log readers, all read-only: `readLogs.sh` (both daemons merged in time order, each line marked `RNSD` or `NOTIFIER` — the one to follow a send from a phone end to end), `rnsdLog.sh` (rnsd: interface events, errors, and at loglevel ≥ 5 announces/paths/links), `notifierLog.sh` (registrations, pushes, relay wakes, refusals), `listTokens.sh` (who is registered). Each takes `-f`, `--only <group>`, `--summary` and a text filter; `--help` lists them.
 

@@ -15,7 +15,7 @@
 #
 # Non-interactive overrides (for `curl | sh` / CI):
 #   RNS_ENV=apt|apk               — skip the environment prompt
-#   RNS_INSTALL=full|rnsd|notifier|fix — skip the "what to install" prompt
+#   RNS_INSTALL=full|rnsd|notifier|fix|update — skip the "what to install" prompt
 #   RNS_NOTIFIER=yes|no           — legacy alias (yes→full, no→rnsd)
 #
 # DESIGN: a single code path per installer, branched only where apt/apk or
@@ -81,6 +81,7 @@
 # Usage:
 #   sudo ./install.sh                 # interactive (env + what to install)
 #   sudo ./install.sh --fix           # repair/update an existing install, no prompts
+#   sudo ./install.sh --update        # upgrade rns + lxmf via pip, restart services
 #   sudo ./install.sh --install-key AuthKey_XXXX.p8 --team-id T --bundle-id B --env production|sandbox
 #   curl -fsSL https://raw.githubusercontent.com/Paydogs/rnsd/master/install.sh | sudo bash
 #   wget -qO- https://raw.githubusercontent.com/Paydogs/rnsd/master/install.sh | sh
@@ -93,6 +94,11 @@
 set -eu
 
 # ---------- Configurable knobs ----------------------------------------------
+# Reticulum / LXMF versions installed by every mode, including --update (which
+# also downgrades to match). Empty = latest on PyPI. Env override:
+#   sudo RNS_VERSION=1.5.4 sh install.sh --update
+RNS_VERSION="${RNS_VERSION-1.5.2}"
+LXMF_VERSION="${LXMF_VERSION-}"
 RNS_USER="${RNS_USER:-reticulum}"
 RNS_GROUP="${RNS_GROUP:-reticulum}"
 RNS_HOME="${RNS_HOME:-/var/lib/reticulum}"
@@ -195,6 +201,11 @@ resolve_pip_flags() {
 }
 # shellcheck disable=SC2086
 pip_install() { resolve_pip_flags; pip3 install --upgrade $PIP_FLAGS "$@"; }
+# rns + lxmf as pip requirement specs, pinned by RNS_VERSION / LXMF_VERSION.
+# Always installed together so an lxmf upgrade can't drag rns off its pin.
+pip_install_rns_lxmf() {
+    pip_install "rns${RNS_VERSION:+==${RNS_VERSION}}" "lxmf${LXMF_VERSION:+==${LXMF_VERSION}}"
+}
 
 # Install Python modules only if they cannot be imported. Prefers the distro
 # package (arg format: module:distro-pkg:pip-pkg) and falls back to pip
@@ -1743,7 +1754,7 @@ install_rnsd() {
     # ═══ PHASE 3 — Install rns + lxmf via pip ══════════════════════════════
     phase "Install rns + lxmf via pip"
     log "Installing/upgrading Reticulum (rns) and LXMF via pip..."
-    pip_install rns lxmf
+    pip_install_rns_lxmf
     RNSD_BIN="$(find_bin rnsd)"
     [ -n "${RNSD_BIN}" ] || { err "rnsd binary not found on PATH after installation."; exit 1; }
     log "rnsd installed at ${RNSD_BIN}"
@@ -1876,7 +1887,7 @@ install_notifier() {
     pkg_install ${CORE_DEPS}
 
     log "Ensuring lxmf (provides lxmd) is installed..."
-    pip_install lxmf
+    pip_install_rns_lxmf
     LXMD_BIN="$(find_bin lxmd)"
     [ -n "${LXMD_BIN}" ] || { err "lxmd binary not found after installing lxmf."; exit 1; }
     log "lxmd installed at ${LXMD_BIN}"
@@ -2579,6 +2590,64 @@ EOF
 }
 
 # ============================================================================
+# Package update mode  (install.sh --update, menu option 5, RNS_INSTALL=update)
+# Brings rns + lxmf to RNS_VERSION / LXMF_VERSION via pip, then restarts the daemons.
+# Touches no config, unit, key or helper script — that is --fix's job.
+# ============================================================================
+
+pip_version() { pip3 show "$1" 2>/dev/null | sed -n 's/^Version: *//p'; }
+
+# A service counts as installed if its unit / init script exists.
+svc_installed() {
+    if [ "$INIT" = systemd ]; then [ -f "/etc/systemd/system/$1.service" ]
+    else [ -f "/etc/init.d/$1" ]; fi
+}
+
+install_update() {
+    log "==> Update rns ${RNS_VERSION:-latest} + lxmf ${LXMF_VERSION:-latest} (${PM} / ${INIT})"
+    PHASE_NUM=0
+    PHASE_TOTAL=3
+    check_rnsd_present
+
+    # ═══ PHASE 1 — Upgrade rns + lxmf via pip ═════════════════════════════
+    phase "Upgrade rns + lxmf via pip"
+    old_rns="$(pip_version rns)"; old_lxmf="$(pip_version lxmf)"
+    pip_install_rns_lxmf
+    new_rns="$(pip_version rns)"; new_lxmf="$(pip_version lxmf)"
+    log "rns : ${old_rns:-none} -> ${new_rns:-none}"
+    log "lxmf: ${old_lxmf:-none} -> ${new_lxmf:-none}"
+
+    # ═══ PHASE 2 — Restart the chain (rnsd, lxmd, notifier) ════════════════
+    phase "Restart services"
+    if [ "${old_rns}" = "${new_rns}" ] && [ "${old_lxmf}" = "${new_lxmf}" ]; then
+        log "Already up to date — no restart needed."
+    else
+        # Order matters: lxmd and the notifier attach to rnsd's shared instance.
+        for svc in rnsd lxmd "${NOTIFIER_NAME}"; do
+            svc_installed "${svc}" || continue
+            svc_restart_or_start "${svc}" || warn "${svc} restart failed"
+            if [ "${svc}" = rnsd ]; then sleep 2; fi
+        done
+    fi
+
+    # ═══ PHASE 3 — Verify ══════════════════════════════════════════════════
+    phase "Verify"
+    sleep 2
+    for svc in rnsd lxmd "${NOTIFIER_NAME}"; do
+        svc_installed "${svc}" || continue
+        if svc_is_active "${svc}"; then log "${svc}: running"; else err "${svc}: NOT running"; fi
+    done
+    cat <<EOF
+
+------------------------------------------------------------
+ Update complete. Configs, keys and service definitions were not touched.
+ If you also pulled a newer install.sh, run:  sudo sh install.sh --fix
+ Run the health check:  checkHealth.sh
+------------------------------------------------------------
+EOF
+}
+
+# ============================================================================
 # Interactive prompts
 # ============================================================================
 
@@ -2644,6 +2713,7 @@ prompt_install() {
         rnsd)     INSTALL_MODE=rnsd;     log "RNS_INSTALL=rnsd — skipping install prompt"; return ;;
         notifier) INSTALL_MODE=notifier; log "RNS_INSTALL=notifier — skipping install prompt"; return ;;
         fix)      INSTALL_MODE=fix;      log "RNS_INSTALL=fix — skipping install prompt"; return ;;
+        update)   INSTALL_MODE=update;   log "RNS_INSTALL=update — skipping install prompt"; return ;;
     esac
     # Legacy alias: RNS_NOTIFIER=yes|no  (yes→full, no→rnsd).
     case "${RNS_NOTIFIER:-}" in
@@ -2665,6 +2735,7 @@ prompt_install() {
     printf '  2) rnsd only\n'
     printf '  3) Analog notifier only    (requires rnsd already installed)%s\n' "${opt3_hint}"
     printf '  4) Repair / update existing install (permissions, ACL, code — keeps configs + keys)\n'
+    printf '  5) Update rns + lxmf packages and restart services (touches nothing else)\n'
     printf 'Enter choice [%s]: ' "${default}"
     read_tty
     case "${REPLY:-${default}}" in
@@ -2672,6 +2743,7 @@ prompt_install() {
         2) INSTALL_MODE=rnsd ;;
         3) INSTALL_MODE=notifier ;;
         4) INSTALL_MODE=fix ;;
+        5) INSTALL_MODE=update ;;
         *) err "Invalid selection: '${REPLY}'"; exit 1 ;;
     esac
 }
@@ -2704,13 +2776,13 @@ main() {
 
     case "${1:-}" in
         --install-key) install_apns_key "$@"; exit 0 ;;
-        --fix)
+        --fix|--update)
             case "${RNS_ENV:-}" in
                 apt) ENV_CHOICE=apt ;; apk) ENV_CHOICE=apk ;;
                 *) if [ "$(detect_default_env)" = 2 ]; then ENV_CHOICE=apk; else ENV_CHOICE=apt; fi ;;
             esac
             resolve_os_switches
-            install_fix
+            if [ "$1" = --fix ]; then install_fix; else install_update; fi
             exit 0 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
@@ -2743,6 +2815,9 @@ main() {
             ;;
         fix)
             install_fix
+            ;;
+        update)
+            install_update
             ;;
     esac
 }
