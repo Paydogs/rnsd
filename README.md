@@ -180,6 +180,8 @@ One detail worth knowing: RNS authenticates a client's RPC calls to the shared i
 
 A plain string means production. A token whose environment is not configured is skipped with a log line; the message still waits at the node.
 
+The notifier **retires a token by itself** when APNs answers `410 Unregistered` — the app was deleted or the token reissued, and Apple treats that as final. The entry is removed and the drop is logged; a phone that comes back registers again on its next launch. `400 BadDeviceToken` is deliberately *not* pruned: it almost always means the token belongs to the other APNs environment, which is a configuration fault on this host, and deleting the registration would hide it.
+
 Example — one hand-added App Store user and one device that registered itself:
 
 ```json
@@ -217,6 +219,39 @@ The `.p8` is a team-wide, non-expiring signing key — whoever holds it can push
 Things only you can do: keep one APNs key per server so a compromised box means revoking one key; keep the `.p8` backed up off the host; put full-disk encryption on the VM; and if third parties will ever run propagation nodes, put the key behind a relay you operate rather than handing it out.
 
 `tokens.json` (`{lxmf_hash: apns_token}`) is low-sensitivity on its own — a device token is only useful together with the key. Until the RNS registration listener is implemented it is filled by hand.
+
+### Analog-only or public
+
+The installer asks once — on a full or rnsd-only install, the two modes that write these configs;
+`--fix` and `--update` touch neither, so they don't ask. Non-interactively: `RNS_SCOPE=analog|public`,
+default `analog`. The answer sets the node's whole posture:
+
+| | Analog only (default) | Public Reticulum |
+|---|---|---|
+| This host's TCP server (`:4242`) | enabled | enabled |
+| LAN `AutoInterface` | disabled | enabled |
+| Built-in public hubs (Beleth, RMAP, …) | disabled | enabled |
+| lxmd `autopeer` | no | yes |
+
+An Analog-only node serves the app's own users and joins nothing: the only interface it runs is
+the TCP server the phones connect to. That is not tidiness — every enabled hub, and the LAN
+interface, is a path for the public mesh to reach the fleet's phones, which is what the section
+below is about.
+
+Switching an existing node is `editRnsConfig.sh` (the `enabled` flags) and `editLxmdConfig.sh`
+(`autopeer`), then restart both — or re-run the installer and answer the other way, which rewrites
+both configs (it backs the old ones up first).
+
+### Peering
+
+`autopeer = no` on an Analog-only node, deliberately. With it on, lxmd adopts every propagation node it
+hears announced: on 2026-08-28 that meant 20 public peers, a 20 MB sync, and the public mesh they
+bridged in flooding the fleet's phones with thousands of paths. This node serves Analog's users.
+
+The cost is that there is no swarm behind it: a message uploaded here lives only here, so this host
+is the single point of failure for offline delivery and for push. A second node of ours belongs in
+lxmd's `peers` as an **explicit** peer, never by discovery. `checkHealth.sh` reads `autopeer` and
+reports 0 peers as expected rather than as a warning.
 
 ## Operating a node
 
@@ -326,6 +361,8 @@ journalctl -u analog-notifier -f
 ## Fallback: per-OS installers
 
 The original single-purpose scripts remain available if you prefer them or need to run only one piece. The unified installer above is otherwise preferred.
+
+They take `RNS_SCOPE=analog|public` like `install.sh` — and default to `analog`, so they no longer write a config that dials the public hubs. They have no prompt: an Analog node needs no argument, a public one is `RNS_SCOPE=public sudo -E bash installRnsd_apt.sh`.
 
 ### rnsd only
 

@@ -146,7 +146,17 @@ if command -v lxmd >/dev/null 2>&1 && svc_active lxmd; then
         NODE_HASH="$(printf '%s\n' "${out}" | sed -n 's/.*Propagation Node running on <\([0-9a-f]*\)>.*/\1/p')"
         printf '%s\n' "${out}" | grep -E 'Messagestore contains|Peers   :|available' | sed 's/^ */          /'
         avail="$(printf '%s\n' "${out}" | awk '/available/ { print $1 }')"
-        [ -n "${avail}" ] && [ "${avail}" -eq 0 ] && warn "lxmd has 0 available peers (fresh node, or all peers unreachable)"
+        # 0 peers is the INTENDED state here: autopeer is off, because adopting every
+        # propagation node lxmd hears bridged the public mesh into the fleet (2026-08-28).
+        # Only warn when the config says peering was actually wanted.
+        autopeer="$(sed -n 's/^[[:space:]]*autopeer[[:space:]]*=[[:space:]]*\([A-Za-z]*\).*/\1/p' \
+                    "${LXMD_CONFIG_DIR}/config" 2>/dev/null | tr 'A-Z' 'a-z' | tail -1)"
+        if [ -n "${avail}" ] && [ "${avail}" -eq 0 ]; then
+            case "${autopeer}" in
+                no|false|off) pass "lxmd has 0 peers (autopeer off — expected for this node)" ;;
+                *) warn "lxmd has 0 available peers (fresh node, or all peers unreachable)" ;;
+            esac
+        fi
     else
         fail "lxmd --status failed: $(printf '%s' "${out}" | tail -1)"
     fi

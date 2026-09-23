@@ -16,6 +16,11 @@
 # Non-interactive overrides (for `curl | sh` / CI):
 #   RNS_ENV=apt|apk               — skip the environment prompt
 #   RNS_INSTALL=full|rnsd|notifier|fix|update — skip the "what to install" prompt
+#   RNS_SCOPE=analog|public       — skip the "what does this node serve" prompt.
+#                                   analog (default): no public hubs, no LAN AutoInterface,
+#                                   lxmd adopts no peers — only this host's TCP server, which
+#                                   is what the phones connect to. public: an ordinary node
+#                                   on the public mesh.
 #   RNS_NOTIFIER=yes|no           — legacy alias (yes→full, no→rnsd)
 #
 # DESIGN: a single code path per installer, branched only where apt/apk or
@@ -99,6 +104,16 @@ set -eu
 #   sudo RNS_VERSION=1.5.4 sh install.sh --update
 RNS_VERSION="${RNS_VERSION-1.5.2}"
 LXMF_VERSION="${LXMF_VERSION-}"
+# Who this node serves. `analog` (the default) keeps it off the public Reticulum mesh: every
+# outbound hub interface and the LAN AutoInterface are written disabled, and lxmd does not adopt
+# propagation peers it hears announced. `public` is an ordinary Reticulum node that joins the
+# public mesh. Set by `prompt_scope`, overridable non-interactively with RNS_SCOPE=analog|public.
+NODE_SCOPE="${RNS_SCOPE:-analog}"
+# Defaults for the two values the generated configs interpolate, so a path that never reaches
+# `prompt_scope` (--fix, --update, a direct call) still writes a valid, Analog-only config rather
+# than `enabled = ` with nothing after it. `resolve_scope` overwrites both.
+PUBLIC_MESH=no
+LXMD_AUTOPEER=no
 RNS_USER="${RNS_USER:-reticulum}"
 RNS_GROUP="${RNS_GROUP:-reticulum}"
 RNS_HOME="${RNS_HOME:-/var/lib/reticulum}"
@@ -319,55 +334,62 @@ write_rns_config() {
 
 [interfaces]
 
-  [[Default Interface]]
-    type = AutoInterface
-    enabled = Yes
-
+  # The node's own server, and the only interface an Analog-only node runs: this is
+  # what the phones connect to. Always enabled — disabling it takes the fleet offline.
   [[Local TCP Server]]
     type = TCPServerInterface
     enabled = yes
     listen_ip = 0.0.0.0
     listen_port = 4242
 
+  # LAN discovery. Off for an Analog-only node: a box on an office LAN will otherwise
+  # find neighbouring Reticulum instances and bridge whatever mesh they carry into the
+  # fleet — which is how the 2026-08-28 announce flood reached the phones.
+  [[Default Interface]]
+    type = AutoInterface
+    enabled = ${PUBLIC_MESH}
+
+  # Public hubs. Enabled only on a public node; for Analog they are the bridge that
+  # brings the whole public mesh (thousands of destinations) onto our users' phones.
   [[Beleth RNS Hub]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = rns.beleth.net
     target_port = 4242
 
   [[Ether Whisperer]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = 132.145.75.143
     target_port = 4242
 
   [[Catz Node (TCP)]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = 77.37.146.243
     target_port = 4242
 
   [[RMAP]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = rmap.world
     target_port = 4242
 
   [[RNS_Transport_US-East]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = 45.77.109.86
     target_port = 4965
 
   [[bnZ-NODE01 (Gothenburg SE)]]
     type = BackboneInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     remote = 91.207.113.250
     target_port = 4242
 
   [[Pleiades Inc.]]
     type = BackboneInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     remote = ahara.jp.net
     target_port = 4242
 EOF
@@ -832,7 +854,34 @@ class Apns:
         log(f"APNs {r.status_code} for {recipient_hash[:8]}… ({self.env}, {kind}): {r.text.strip()}")
         if r.status_code == 403:      # ExpiredProviderToken / InvalidProviderToken
             self._jwt = None
+        if r.status_code == 410:      # Unregistered — the app was deleted or the token reissued
+            self._retire(recipient_hash, r)
         return False
+
+    def _retire(self, recipient_hash, response):
+        """Forget a token Apple says is dead for good.
+
+        `410 Unregistered` is final: without this the notifier re-pushes to deleted installs
+        forever and the DB only grows (14 registrations for a five-device fleet, 2026-09-23).
+        A phone that comes back registers again on its next launch, so nothing is lost.
+
+        Deliberately NOT `400 BadDeviceToken`, which usually means the token belongs to the
+        OTHER APNs environment — a configuration fault here, not a dead device. Dropping it
+        would delete a good registration and hide the misconfiguration.
+        """
+        try:
+            reason = response.json().get("reason")
+        except Exception:
+            reason = None
+        if reason not in (None, "Unregistered"):
+            return
+        raw = load_tokens_raw(self.cp)
+        key = next((k for k in raw if k.lower() == recipient_hash.lower()), None)
+        if key is None:
+            return
+        del raw[key]
+        save_tokens_atomic(self.cp, raw)
+        log(f"dropped token for {recipient_hash[:8]}… (APNs: Unregistered); {len(raw)} registration(s) left")
 
 
 # --- rnsd path table (relay wake) -------------------------------------------
@@ -1326,7 +1375,12 @@ write_lxmd_config() {
   # Must be Yes to run a propagation node (store-and-forward for offline users).
   enable_node = Yes
   announce_at_start = yes
-  autopeer = yes
+  # Follows the node's scope (see RNS_SCOPE / the install prompt). Off for an Analog-only
+  # node: with autopeer on, lxmd adopts every propagation node it hears announced — on
+  # 2026-08-28 that meant 20 public peers and a 20 MB sync, and the public mesh they
+  # bridged in flooded the fleet's phones (5-22k paths each). A second node of ours belongs
+  # here as an explicit peer, not discovered.
+  autopeer = ${LXMD_AUTOPEER}
   autopeer_maxdepth = 4
   # Max accepted transfer size in KB.
   propagation_transfer_max_accepted_size = 256
@@ -2701,6 +2755,44 @@ prompt_env() {
     esac
 }
 
+# Turns the scope into the two values the generated configs interpolate.
+resolve_scope() {
+    case "${NODE_SCOPE}" in
+        public)
+            PUBLIC_MESH=yes
+            LXMD_AUTOPEER=yes
+            ;;
+        *)
+            NODE_SCOPE=analog
+            PUBLIC_MESH=no
+            LXMD_AUTOPEER=no
+            ;;
+    esac
+}
+
+prompt_scope() {
+    case "${RNS_SCOPE:-}" in
+        analog) NODE_SCOPE=analog; log "RNS_SCOPE=analog — skipping scope prompt"; resolve_scope; return ;;
+        public) NODE_SCOPE=public; log "RNS_SCOPE=public — skipping scope prompt"; resolve_scope; return ;;
+    esac
+
+    printf '\n\033[1mWhat does this node serve?\033[0m\n'
+    printf '  1) Analog only        — the app'"'"'s own users. Joins no public hub, adopts no\n'
+    printf '                          propagation peers. Only the TCP server on this host is\n'
+    printf '                          enabled, which is what the phones connect to.\n'
+    printf '  2) Public Reticulum   — an ordinary node on the public mesh: dials the built-in\n'
+    printf '                          hubs, LAN AutoInterface on, lxmd peers with propagation\n'
+    printf '                          nodes it hears.\n'
+    printf 'Enter choice [1]: '
+    read_tty
+    case "${REPLY:-1}" in
+        1|analog|Analog|ANALOG) NODE_SCOPE=analog ;;
+        2|public|Public|PUBLIC) NODE_SCOPE=public ;;
+        *) err "Invalid selection: '${REPLY}'"; exit 1 ;;
+    esac
+    resolve_scope
+}
+
 # Is rnsd already installed on this system? (config dir + service user present)
 rnsd_installed() {
     [ -d "${RNS_CONFIG_DIR}" ] && id -u "${RNS_USER}" >/dev/null 2>&1
@@ -2798,6 +2890,11 @@ main() {
 
     prompt_env
     prompt_install
+    # Only the modes that write the rnsd/lxmd configs have anything to do with the answer;
+    # `fix` and `update` touch neither, so asking there is a question whose answer is thrown away.
+    case "${INSTALL_MODE}" in
+        full|rnsd) prompt_scope ;;
+    esac
     resolve_os_switches
 
     printf '\n'

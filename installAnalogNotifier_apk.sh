@@ -292,11 +292,41 @@ def send_apns(cp, device_token, recipient_hash):
     }
     with httpx.Client(http2=True, timeout=15) as c:
         r = c.post(url, json=payload, headers=headers)
-    if r.status_code != 200:
-        log(f"APNs {r.status_code} for {recipient_hash[:8]}…: {r.text}")
-    else:
+    if r.status_code == 200:
         log(f"APNs ping sent for {recipient_hash[:8]}…")
-    return r.status_code == 200
+        return True, None
+    reason = None
+    try:
+        reason = r.json().get("reason")
+    except Exception:
+        pass
+    log(f"APNs {r.status_code} for {recipient_hash[:8]}…: {r.text}")
+    return False, reason
+
+
+def drop_token_if_dead(cp, recipient_hash, reason):
+    """Forget a token APNs says will never work again.
+
+    Only `Unregistered` (410): Apple returns it when the app was deleted or the token was
+    reissued, and it is final — re-pushing to it wastes a request per message forever, and the
+    store only ever grows (14 registrations for a 5-device fleet, 2026-09-23).
+
+    Deliberately NOT `BadDeviceToken`, which usually means the token was issued for the other
+    APNs environment — a dev build's token pushed at production. That is a configuration fault
+    here, not a dead device, and dropping the token would delete a perfectly good registration
+    and hide the misconfiguration. It is logged loudly instead.
+    """
+    if reason == "BadDeviceToken":
+        log(f"APNs rejected {recipient_hash[:8]}… as BadDeviceToken — token belongs to the "
+            f"other APNs environment; check [apns.*] host/bundle. Token KEPT.")
+        return
+    if reason != "Unregistered":
+        return
+    tokens = load_tokens(cp)
+    if tokens.pop(recipient_hash, None) is None:
+        return
+    save_tokens(cp, tokens)
+    log(f"dropped token for {recipient_hash[:8]}… (APNs: Unregistered); {len(tokens)} left")
 
 
 # --- trigger mode (lxmd on_inbound) -----------------------------------------
@@ -325,7 +355,9 @@ def trigger(args, cp):
     if not token:
         log(f"no token registered for {h[:8]}… — mail waits at the node")
         return 0
-    send_apns(cp, token, h)
+    ok, reason = send_apns(cp, token, h)
+    if not ok:
+        drop_token_if_dead(cp, h, reason)
     return 0
 
 
@@ -455,7 +487,12 @@ cat > "${LXMD_CONFIG_FILE}" <<EOF
   # Must be Yes to run a propagation node (store-and-forward for offline users).
   enable_node = Yes
   announce_at_start = yes
-  autopeer = yes
+  # OFF deliberately. With autopeer on, lxmd adopts every propagation node it hears
+  # announced: on 2026-08-28 that meant 20 public peers and a 20 MB sync, and the public
+  # mesh they bridged in flooded the fleet's phones (5-22k paths each). This node serves
+  # Analog's own users; a second node of ours should be added as an explicit peer here,
+  # not discovered.
+  autopeer = no
   autopeer_maxdepth = 4
   # Max accepted transfer size in KB.
   propagation_transfer_max_accepted_size = 256

@@ -18,6 +18,13 @@
 set -euo pipefail
 
 # ---------- Configurable knobs ----------------------------------------------
+# Who this node serves. `analog` (the default) keeps it off the public Reticulum mesh: the
+# hub interfaces and the LAN AutoInterface below are written disabled, leaving only this
+# host's TCP server, which is what the phones connect to. `RNS_SCOPE=public` makes it an
+# ordinary public node. Same switch as the unified install.sh, which this script predates.
+NODE_SCOPE="${RNS_SCOPE:-analog}"
+if [ "${NODE_SCOPE}" = public ]; then PUBLIC_MESH=yes; else PUBLIC_MESH=no; fi
+
 RNS_USER="${RNS_USER:-reticulum}"
 RNS_GROUP="${RNS_GROUP:-reticulum}"
 RNS_HOME="${RNS_HOME:-/var/lib/reticulum}"
@@ -205,55 +212,60 @@ cat > "${CONFIG_FILE}" <<EOF
 
 [interfaces]
 
-  [[Default Interface]]
-    type = AutoInterface
-    enabled = Yes
-
+  # The node's own server: what the phones connect to. Always enabled.
   [[Local TCP Server]]
     type = TCPServerInterface
     enabled = yes
     listen_ip = 0.0.0.0
     listen_port = 4242
 
+  # LAN discovery. Off unless this is a public node — a box on an office LAN will
+  # otherwise find neighbouring Reticulum instances and bridge their mesh in.
+  [[Default Interface]]
+    type = AutoInterface
+    enabled = ${PUBLIC_MESH}
+
+  # Public hubs. Enabled only on a public node; for an Analog-only node these are the
+  # bridge that brings the whole public mesh onto the fleet's phones (2026-08-28).
   [[Beleth RNS Hub]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = rns.beleth.net
     target_port = 4242
 
   [[Ether Whisperer]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = 132.145.75.143
     target_port = 4242
 
   [[Catz Node (TCP)]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = 77.37.146.243
     target_port = 4242
 
   [[RMAP]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = rmap.world
     target_port = 4242
 
   [[RNS_Transport_US-East]]
     type = TCPClientInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     target_host = 45.77.109.86
     target_port = 4965
 
   [[bnZ-NODE01 (Gothenburg SE)]]
     type = BackboneInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     remote = 91.207.113.250
     target_port = 4242
 
   [[Pleiades Inc.]]
     type = BackboneInterface
-    enabled = yes
+    enabled = ${PUBLIC_MESH}
     remote = ahara.jp.net
     target_port = 4242
 EOF
