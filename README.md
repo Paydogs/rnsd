@@ -66,7 +66,7 @@ curl -fsSLO https://raw.githubusercontent.com/Paydogs/rnsd/master/install.sh
 sudo RNS_ENV=apt RNS_INSTALL=full sh install.sh
 ```
 
-**Reticulum version.** `RNS_VERSION` near the top of `install.sh` (default `1.5.2`) pins the `rns` release that every mode installs; `LXMF_VERSION` does the same for `lxmf` (empty = latest). Set either one to empty to always get the latest, or override it for one run: `sudo RNS_VERSION=1.5.4 sh install.sh --update`.
+**Reticulum version.** `RNS_VERSION` near the top of `install.sh` (default `1.5.7`) pins the `rns` release that every mode installs; `LXMF_VERSION` does the same for `lxmf` (empty = latest). Set either one to empty to always get the latest, or override it for one run: `sudo RNS_VERSION=1.5.4 sh install.sh --update`.
 
 Each install runs in clearly marked phases (6 for rnsd, 6 for the notifier) printed live as it goes; the same phase structure is used on both OSes.
 

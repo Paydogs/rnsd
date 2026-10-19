@@ -102,7 +102,7 @@ set -eu
 # Reticulum / LXMF versions installed by every mode, including --update (which
 # also downgrades to match). Empty = latest on PyPI. Env override:
 #   sudo RNS_VERSION=1.5.4 sh install.sh --update
-RNS_VERSION="${RNS_VERSION-1.5.2}"
+RNS_VERSION="${RNS_VERSION-1.5.7}"
 LXMF_VERSION="${LXMF_VERSION-}"
 # Who this node serves. `analog` (the default) keeps it off the public Reticulum mesh: every
 # outbound hub interface and the LAN AutoInterface are written disabled, and lxmd does not adopt
@@ -1821,14 +1821,15 @@ install_rnsd() {
     fi
     CONFIG_FILE="${RNS_CONFIG_DIR}/config"
     HOSTNAME_SLUG="$(hostname | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')"
-    # Keep an existing rpc_key across reinstalls so clients stay in sync.
-    RPC_KEY="$( [ -f "${CONFIG_FILE}" ] && sed -n 's/^[[:space:]]*rpc_key[[:space:]]*=[[:space:]]*//p' "${CONFIG_FILE}" | head -1 )"
-    [ -n "${RPC_KEY}" ] || RPC_KEY="$(gen_rpc_key)"
+    RPC_KEY=""
     if [ -f "${CONFIG_FILE}" ]; then
+        # Keep an existing rpc_key across reinstalls so clients stay in sync.
+        RPC_KEY="$(sed -n 's/^[[:space:]]*rpc_key[[:space:]]*=[[:space:]]*//p' "${CONFIG_FILE}" | head -1)"
         BACKUP="${CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
         log "Backing up existing config -> ${BACKUP}"
         cp -a "${CONFIG_FILE}" "${BACKUP}"
     fi
+    [ -n "${RPC_KEY}" ] || RPC_KEY="$(gen_rpc_key)"
     write_rns_config
 
     # ═══ PHASE 5 — Write service definition ════════════════════════════════
